@@ -12,6 +12,7 @@ Ce projet permet de contrôler un relais connecté à un chauffage Webasto via l
 
 - Communication sans fil via ESP-NOW (faible latence, faible consommation)
 - Apprentissage automatique de l'adresse MAC du contrôleur
+- Test automatique du relais au démarrage
 - Sécurité : arrêt automatique si perte de connexion (timeout 3 minutes)
 - LED de statut intégrée
 - Mode économie d'énergie (CPU à 80 MHz)
@@ -19,17 +20,20 @@ Ce projet permet de contrôler un relais connecté à un chauffage Webasto via l
 ## Matériel requis
 
 - ESP32-C3 Super Mini
-- Module relais (5V ou 3.3V selon modèle)
-- Alimentation adaptée
+- Module relais 5V
+- Alimentation 5V
 
 ## Câblage
 
-| ESP32-C3 | Composant |
-|----------|-----------|
-| GPIO2    | Relais (commande) |
-| GPIO8    | LED de statut (interne) |
-| 3.3V/5V  | Alimentation relais |
-| GND      | GND commun |
+| ESP32-C3 | Module Relais |
+|----------|---------------|
+| GPIO7    | IN (Signal)   |
+| 5V       | VCC           |
+| GND      | GND           |
+
+| ESP32-C3 | LED |
+|----------|-----|
+| GPIO8    | LED interne (statut) |
 
 ## Configuration
 
@@ -37,10 +41,10 @@ Modifier `src/config.h` selon vos besoins :
 
 ```c
 // Pin du relais
-#define RELAY_PIN     2
+#define RELAY_PIN     7     // GPIO7
 
 // LED de statut
-#define LED_STATUS    8
+#define LED_STATUS    8     // GPIO8
 
 // Logique du relais
 #define RELAY_ACTIVE_HIGH  true   // true = HIGH pour activer
@@ -53,19 +57,19 @@ Modifier `src/config.h` selon vos besoins :
 
 ### Commandes reçues
 
-| Code | Commande | Description |
-|------|----------|-------------|
-| 1    | CMD_HEAT_ON | Activer le chauffage |
-| 2    | CMD_HEAT_OFF | Désactiver le chauffage |
-| 3    | CMD_PING | Vérifier la connexion |
+| Code | Commande     | Description              |
+|------|--------------|--------------------------|
+| 1    | CMD_HEAT_ON  | Activer le chauffage     |
+| 2    | CMD_HEAT_OFF | Désactiver le chauffage  |
+| 3    | CMD_PING     | Vérifier la connexion    |
 
 ### Réponses envoyées
 
-| Code | Réponse | Description |
-|------|---------|-------------|
-| 11   | ACK_ON | Chauffage activé |
-| 12   | ACK_OFF | Chauffage désactivé |
-| 13   | ACK_PONG | Réponse au ping |
+| Code | Réponse  | Description        |
+|------|----------|--------------------|
+| 11   | ACK_ON   | Chauffage activé   |
+| 12   | ACK_OFF  | Chauffage désactivé|
+| 13   | ACK_PONG | Réponse au ping    |
 
 ## Installation
 
@@ -88,15 +92,38 @@ pio device monitor
 
 ## Sécurité
 
-Le module intègre une sécurité importante : si aucune commande n'est reçue pendant 3 minutes alors que le chauffage est actif, le relais est automatiquement coupé. Cela évite que le chauffage reste allumé en cas de perte de connexion avec le contrôleur.
+Le module intègre une sécurité importante : si aucune commande n'est reçue pendant **3 minutes** alors que le chauffage est actif, le relais est automatiquement coupé. Cela évite que le chauffage reste allumé en cas de perte de connexion avec le contrôleur.
+
+## Test au démarrage
+
+Au démarrage, le module effectue un test automatique du relais :
+1. Active le relais (HIGH) pendant 1 seconde
+2. Désactive le relais (LOW) pendant 1 seconde
+3. Initialise le relais en position OFF
+
+Vous devriez entendre deux clics du relais au démarrage.
 
 ## Débogage
 
 Le moniteur série (115200 bauds) affiche :
 - L'adresse MAC du module au démarrage
+- Le test du relais (GPIO utilisé, HIGH/LOW)
 - Les commandes reçues
 - Les réponses envoyées
 - Les alertes de sécurité
+
+## Structure du projet
+
+```
+ESPBastoRelay/
+├── src/
+│   ├── main.cpp      # Code principal
+│   └── config.h      # Configuration (pins, constantes)
+├── platformio.ini    # Configuration PlatformIO
+├── README.md         # Ce fichier
+├── specs.md          # Spécifications techniques
+└── LICENSE
+```
 
 ## Voir aussi
 

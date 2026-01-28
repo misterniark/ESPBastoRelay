@@ -45,8 +45,10 @@ void setRelay(bool on) {
     relayOn = on;
     
     if (RELAY_ACTIVE_HIGH) {
+        pinMode(RELAY_PIN, OUTPUT);
         digitalWrite(RELAY_PIN, on ? HIGH : LOW);
     } else {
+        pinMode(RELAY_PIN, INPUT);
         digitalWrite(RELAY_PIN, on ? LOW : HIGH);
     }
     
@@ -174,8 +176,21 @@ void setup() {
     pinMode(RELAY_PIN, OUTPUT);
     pinMode(LED_STATUS, OUTPUT);
     
-    // État initial : relais OFF
-    setRelay(false);
+    /* Test du relais au démarrage
+    Serial.println("Test relais...");
+    Serial.print("GPIO: ");
+    Serial.println(RELAY_PIN);*/
+    
+    // ON
+   /* digitalWrite(RELAY_PIN, HIGH);
+    Serial.println("Relais HIGH");
+    delay(1000);*/
+    
+    // OFF
+   /* digitalWrite(RELAY_PIN, LOW);
+    Serial.println("Relais LOW");
+    delay(1000);*/
+
     
     // Afficher adresse MAC
     WiFi.mode(WIFI_STA);
