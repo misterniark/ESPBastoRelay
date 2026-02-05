@@ -12,10 +12,13 @@ Ce projet permet de contrôler un relais connecté à un chauffage Webasto via l
 
 - Communication sans fil via ESP-NOW (faible latence, faible consommation)
 - Apprentissage automatique de l'adresse MAC du contrôleur
-- Test automatique du relais au démarrage
-- Sécurité : arrêt automatique si perte de connexion (timeout 3 minutes)
 - LED de statut intégrée
 - Mode économie d'énergie (CPU à 80 MHz)
+
+### Sécurités intégrées
+
+- **Arrêt automatique** : si perte de connexion pendant 3 minutes (chauffage actif)
+- **Anti-redémarrage rapide** : délai obligatoire de 3 minutes après arrêt avant de pouvoir redémarrer
 
 ## Matériel requis
 
@@ -65,11 +68,13 @@ Modifier `src/config.h` selon vos besoins :
 
 ### Réponses envoyées
 
-| Code | Réponse  | Description        |
-|------|----------|--------------------|
-| 11   | ACK_ON   | Chauffage activé   |
-| 12   | ACK_OFF  | Chauffage désactivé|
-| 13   | ACK_PONG | Réponse au ping    |
+| Code | Réponse      | Description                          |
+|------|--------------|--------------------------------------|
+| 11   | ACK_ON       | Chauffage activé                     |
+| 12   | ACK_OFF      | Chauffage désactivé                  |
+| 13   | ACK_PONG     | Réponse au ping                      |
+| 14   | ACK_LOCKED   | Redémarrage bloqué (délai sécurité)  |
+| 15   | ACK_UNLOCKED | Redémarrage autorisé (délai expiré)  |
 
 ## Installation
 
@@ -90,27 +95,33 @@ pio run -t upload
 pio device monitor
 ```
 
-## Sécurité
+## Sécurités
 
-Le module intègre une sécurité importante : si aucune commande n'est reçue pendant **3 minutes** alors que le chauffage est actif, le relais est automatiquement coupé. Cela évite que le chauffage reste allumé en cas de perte de connexion avec le contrôleur.
+Le module intègre deux mécanismes de sécurité pour protéger le chauffage Webasto :
 
-## Test au démarrage
+### 1. Arrêt automatique (perte de connexion)
 
-Au démarrage, le module effectue un test automatique du relais :
-1. Active le relais (HIGH) pendant 1 seconde
-2. Désactive le relais (LOW) pendant 1 seconde
-3. Initialise le relais en position OFF
+Si aucune commande n'est reçue pendant **3 minutes** alors que le chauffage est actif, le relais est automatiquement coupé. Cela évite que le chauffage reste allumé en cas de perte de connexion avec le contrôleur.
 
-Vous devriez entendre deux clics du relais au démarrage.
+### 2. Anti-redémarrage rapide
+
+Après chaque arrêt du chauffage (passage à OFF), un délai de **3 minutes** est imposé avant de pouvoir le redémarrer. Cette protection évite les cycles ON/OFF rapides qui pourraient endommager le Webasto.
+
+- Si une commande `CMD_HEAT_ON` est reçue pendant ce délai, le module répond `ACK_LOCKED` (code 14)
+- Dès que le délai expire, le module envoie automatiquement `ACK_UNLOCKED` (code 15)
+- Le contrôleur peut ainsi informer l'utilisateur en temps réel
 
 ## Débogage
 
 Le moniteur série (115200 bauds) affiche :
 - L'adresse MAC du module au démarrage
-- Le test du relais (GPIO utilisé, HIGH/LOW)
 - Les commandes reçues
 - Les réponses envoyées
-- Les alertes de sécurité
+- Les alertes de sécurité :
+  - `Verrou anti-redemarrage active (3 min)` - après arrêt
+  - `!!! REDEMARRAGE BLOQUE - Attendre X secondes !!!` - si tentative prématurée
+  - `Verrou anti-redemarrage expire` - délai écoulé
+  - `!!! SECURITE: Perte connexion controleur !!!` - arrêt automatique
 
 ## Structure du projet
 

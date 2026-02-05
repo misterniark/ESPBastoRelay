@@ -24,6 +24,8 @@
 #define ACK_ON        11
 #define ACK_OFF       12
 #define ACK_PONG      13
+#define ACK_LOCKED    14    // Redémarrage bloqué (délai de sécurité)
+#define ACK_UNLOCKED  15    // Redémarrage autorisé (délai expiré)
 
 // ============================================
 // CONFIGURATION RELAIS

@@ -23,6 +23,11 @@ bool relayOn = false;
 unsigned long lastPingReceived = 0;
 bool controllerConnected = false;
 
+// Sécurité anti-redémarrage rapide
+unsigned long lastRelayOff = 0;           // Moment du dernier arrêt
+bool restartLockActive = false;           // Verrou actif
+const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes de délai
+
 // Adresse MAC du contrôleur (sera apprise automatiquement)
 uint8_t controllerMac[6] = {0};
 bool controllerKnown = false;
@@ -42,6 +47,7 @@ esp_now_message_t outgoingMsg;
 // ============================================
 
 void setRelay(bool on) {
+    bool wasOn = relayOn;  // État précédent
     relayOn = on;
     
     if (RELAY_ACTIVE_HIGH) {
@@ -55,8 +61,30 @@ void setRelay(bool on) {
     // LED de statut
     digitalWrite(LED_STATUS, on ? LOW : HIGH);  // LED active LOW
     
+    // Activer le verrou UNIQUEMENT si passage de ON à OFF
+    if (wasOn && !on) {
+        lastRelayOff = millis();
+        restartLockActive = true;
+        Serial.println("Verrou anti-redemarrage active (3 min)");
+    }
+    
     Serial.print("Relais: ");
     Serial.println(on ? "ON" : "OFF");
+}
+
+// Vérifie si le redémarrage est autorisé
+bool canRestart() {
+    if (!restartLockActive) {
+        return true;
+    }
+    
+    // Afficher le temps restant
+    unsigned long elapsed = millis() - lastRelayOff;
+    unsigned long remaining = (RESTART_DELAY_MS - elapsed) / 1000;
+    Serial.print("!!! REDEMARRAGE BLOQUE - Attendre ");
+    Serial.print(remaining);
+    Serial.println(" secondes !!!");
+    return false;
 }
 
 // ============================================
@@ -115,8 +143,12 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int l
     
     switch (incomingMsg.command) {
         case CMD_HEAT_ON:
-            setRelay(true);
-            sendResponse(ACK_ON);
+            if (canRestart()) {
+                setRelay(true);
+                sendResponse(ACK_ON);
+            } else {
+                sendResponse(ACK_LOCKED);  // Redémarrage bloqué
+            }
             controllerConnected = true;
             lastPingReceived = millis();
             break;
@@ -219,6 +251,15 @@ void setup() {
 
 void loop() {
     unsigned long now = millis();
+    
+    // Vérifier si le verrou anti-redémarrage vient d'expirer
+    if (restartLockActive) {
+        if (now - lastRelayOff >= RESTART_DELAY_MS) {
+            restartLockActive = false;
+            Serial.println("Verrou anti-redemarrage expire");
+            sendResponse(ACK_UNLOCKED);  // Notifier le contrôleur
+        }
+    }
     
     // Sécurité : arrêt si pas de ping depuis trop longtemps
     if (controllerConnected && relayOn) {

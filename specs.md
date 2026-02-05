@@ -74,10 +74,12 @@ typedef struct {
 | Relais → Contrôleur | 11 | ACK_ON | Confirmation activation |
 | Relais → Contrôleur | 12 | ACK_OFF | Confirmation désactivation |
 | Relais → Contrôleur | 13 | ACK_PONG | Réponse ping |
+| Relais → Contrôleur | 14 | ACK_LOCKED | Redémarrage bloqué (délai sécurité) |
+| Relais → Contrôleur | 15 | ACK_UNLOCKED | Redémarrage autorisé (délai expiré) |
 
-## Sécurité
+## Sécurités
 
-### Timeout watchdog
+### 1. Timeout watchdog (perte de connexion)
 
 | Paramètre | Valeur |
 |-----------|--------|
@@ -85,7 +87,17 @@ typedef struct {
 | Condition | Chauffage actif ET aucune commande reçue |
 | Action | Arrêt automatique du relais |
 
-### Séquence de sécurité
+### 2. Anti-redémarrage rapide
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Durée | 180 000 ms (3 minutes) |
+| Déclencheur | Passage du relais à OFF |
+| Action | Blocage de CMD_HEAT_ON, réponse ACK_LOCKED |
+
+Cette protection évite les cycles ON/OFF rapides qui pourraient endommager le chauffage Webasto.
+
+### Diagramme de sécurité watchdog
 
 ```
 Chauffage ON
@@ -114,6 +126,45 @@ Chauffage ON
               Log erreur  │
 ```
 
+### Diagramme anti-redémarrage
+
+```
+Relais passe à OFF
+    │
+    ▼
+Verrou activé (3 min)
+    │
+    ▼
+┌─────────────────────┐
+│ Loop: vérification  │◄─────┐
+│ périodique          │      │
+└─────────┬───────────┘      │
+          │                  │
+     Délai écoulé ?          │
+          │                  │
+     ┌────┴────┐             │
+     │NON      │OUI          │
+     ▼         ▼             │
+   Attente   ACK_UNLOCKED    │
+     │       envoyé          │
+     │       Verrou OFF      │
+     └───────────────────────┘
+
+
+CMD_HEAT_ON reçu
+    │
+    ▼
+┌─────────────────┐
+│ Verrou actif ?  │
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    │NON      │OUI
+    ▼         ▼
+ Relais ON  ACK_LOCKED
+ ACK_ON     (bloqué)
+```
+
 ## Séquence de démarrage
 
 1. Initialisation Serial (115200 bauds)
@@ -121,15 +172,11 @@ Chauffage ON
 3. Configuration CPU 80 MHz
 4. Initialisation NVS
 5. Configuration GPIO (relais + LED)
-6. **Test relais** :
-   - HIGH pendant 1 seconde
-   - LOW pendant 1 seconde
-7. État initial relais OFF
-8. Initialisation WiFi (mode STA)
-9. Affichage adresse MAC
-10. Initialisation ESP-NOW
-11. Enregistrement callbacks
-12. Attente commandes
+6. Initialisation WiFi (mode STA)
+7. Affichage adresse MAC
+8. Initialisation ESP-NOW
+9. Enregistrement callbacks
+10. Attente commandes
 
 ## Consommation électrique
 
@@ -163,9 +210,11 @@ build_flags =
 2. **Single peer** : Un seul contrôleur peut être enregistré (le premier à envoyer une commande)
 3. **Pas de persistance** : L'adresse du contrôleur n'est pas sauvegardée après redémarrage
 4. **GPIO2 à éviter** : Strapping pin pouvant causer des problèmes au boot
+5. **Délai anti-redémarrage** : 3 minutes obligatoires après arrêt (le contrôleur doit gérer ACK_LOCKED)
 
 ## Historique des versions
 
 | Version | Date | Modifications |
 |---------|------|---------------|
 | 1.0.0 | Janvier 2026 | Version initiale production |
+| 1.1.0 | Janvier 2026 | Ajout sécurité anti-redémarrage rapide (3 min) |
