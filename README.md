@@ -174,6 +174,7 @@ ESPBastoRelay/
 ## Voir aussi
 
 - [ESPBasto](https://github.com/misterniark/ESPBasto) - contrôleur thermostat avec écran `ST7735`, encodeur rotatif et capteur `AHT21`
+- [ESPBastoCheapYellow](https://github.com/misterniark/ESPBastoCheapYellow) - contrôleur thermostat pour le module **ESP32-2432S028R** (CheapYellowDisplay) et capteur `AHT21`
 
 ## Licence
 
