@@ -2,14 +2,24 @@
 #define CONFIG_H
 
 // ============================================
-// CONFIGURATION RELAIS - ESP32-C3 Super Mini
+// CONFIGURATION RELAIS - XIAO ESP32-C3
 // ============================================
 
 // Pin du relais (à adapter selon votre câblage)
-#define RELAY_PIN     7     // GPIO4 - Commande relais (éviter GPIO2 strapping pin)
+// Sur XIAO ESP32-C3, D1 correspond à GPIO3
+#define RELAY_PIN     D1
+
+// Bouton manuel de secours
+// Sur XIAO ESP32-C3, le bouton BOOT est sur D9 / GPIO9.
+// Attention: si maintenu pendant le démarrage, la carte peut entrer en bootloader.
+#define MANUAL_BUTTON_PIN              D9
+#define MANUAL_BUTTON_ACTIVE_STATE     LOW
+#define MANUAL_BUTTON_LONG_PRESS_MS    2000
 
 // LED de statut (optionnel)
-#define LED_STATUS    8     // GPIO8 - LED interne ESP32-C3
+// Le XIAO ESP32-C3 n'expose pas de LED utilisateur pilotable intégrée.
+// Mettre D10 si vous branchez une LED externe, sinon laisser -1.
+#define LED_STATUS    -1
 
 // ============================================
 // ESP-NOW - COMMANDES (identiques au contrôleur)

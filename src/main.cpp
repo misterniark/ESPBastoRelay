@@ -1,6 +1,6 @@
 /*
  * ============================================
- * RELAIS WEBASTO - ESP32-C3 Super Mini
+ * RELAIS WEBASTO - XIAO ESP32-C3
  * ============================================
  * 
  * Reçoit les commandes ESP-NOW du contrôleur
@@ -28,6 +28,13 @@ unsigned long lastRelayOff = 0;           // Moment du dernier arrêt
 bool restartLockActive = false;           // Verrou actif
 const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes de délai
 
+// Override manuel via bouton BOOT
+bool manualOverrideActive = false;
+bool manualForcedState = false;
+bool manualButtonPressed = false;
+bool manualButtonHandled = false;
+unsigned long manualButtonPressStart = 0;
+
 // Adresse MAC du contrôleur (sera apprise automatiquement)
 uint8_t controllerMac[6] = {0};
 bool controllerKnown = false;
@@ -42,6 +49,25 @@ typedef struct {
 
 esp_now_message_t outgoingMsg;
 
+// Déclarations anticipées
+void sendResponse(uint8_t response);
+
+// ============================================
+// FONCTIONS LED
+// ============================================
+
+void setStatusLed(bool on) {
+    if (LED_STATUS < 0) {
+        return;
+    }
+
+    digitalWrite(LED_STATUS, on ? LOW : HIGH);  // LED active LOW
+}
+
+void sendCurrentStateResponse() {
+    sendResponse(relayOn ? ACK_ON : ACK_OFF);
+}
+
 // ============================================
 // FONCTIONS RELAIS
 // ============================================
@@ -50,16 +76,15 @@ void setRelay(bool on) {
     bool wasOn = relayOn;  // État précédent
     relayOn = on;
     
+    // Commander le relais selon la logique configurée
     if (RELAY_ACTIVE_HIGH) {
-        pinMode(RELAY_PIN, OUTPUT);
         digitalWrite(RELAY_PIN, on ? HIGH : LOW);
     } else {
-        pinMode(RELAY_PIN, INPUT);
         digitalWrite(RELAY_PIN, on ? LOW : HIGH);
     }
     
     // LED de statut
-    digitalWrite(LED_STATUS, on ? LOW : HIGH);  // LED active LOW
+    setStatusLed(on);
     
     // Activer le verrou UNIQUEMENT si passage de ON à OFF
     if (wasOn && !on) {
@@ -85,6 +110,56 @@ bool canRestart() {
     Serial.print(remaining);
     Serial.println(" secondes !!!");
     return false;
+}
+
+void handleManualOverrideAction() {
+    if (!manualOverrideActive) {
+        manualOverrideActive = true;
+        manualForcedState = !relayOn;
+        Serial.println("Override manuel active");
+    } else if (manualForcedState) {
+        manualForcedState = false;
+    } else {
+        manualOverrideActive = false;
+        Serial.println("Override manuel desactive - retour controle ESP-NOW");
+        sendCurrentStateResponse();
+        return;
+    }
+
+    if (manualForcedState) {
+        if (canRestart()) {
+            setRelay(true);
+            Serial.println("Override manuel: chauffage FORCE ON");
+            sendResponse(ACK_ON);
+        } else {
+            Serial.println("Override manuel: FORCE ON refuse par verrou");
+            sendResponse(ACK_LOCKED);
+        }
+    } else {
+        setRelay(false);
+        Serial.println("Override manuel: chauffage FORCE OFF");
+        sendResponse(ACK_OFF);
+    }
+}
+
+void updateManualButton() {
+    bool pressed = digitalRead(MANUAL_BUTTON_PIN) == MANUAL_BUTTON_ACTIVE_STATE;
+    unsigned long now = millis();
+
+    if (pressed) {
+        if (!manualButtonPressed) {
+            manualButtonPressed = true;
+            manualButtonHandled = false;
+            manualButtonPressStart = now;
+        } else if (!manualButtonHandled &&
+                   (now - manualButtonPressStart >= MANUAL_BUTTON_LONG_PRESS_MS)) {
+            manualButtonHandled = true;
+            handleManualOverrideAction();
+        }
+    } else {
+        manualButtonPressed = false;
+        manualButtonHandled = false;
+    }
 }
 
 // ============================================
@@ -143,6 +218,13 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int l
     
     switch (incomingMsg.command) {
         case CMD_HEAT_ON:
+            if (manualOverrideActive) {
+                Serial.println("Commande distante ignoree: override manuel actif");
+                sendCurrentStateResponse();
+                controllerConnected = true;
+                lastPingReceived = millis();
+                break;
+            }
             if (canRestart()) {
                 setRelay(true);
                 sendResponse(ACK_ON);
@@ -154,6 +236,13 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int l
             break;
             
         case CMD_HEAT_OFF:
+            if (manualOverrideActive) {
+                Serial.println("Commande distante ignoree: override manuel actif");
+                sendCurrentStateResponse();
+                controllerConnected = true;
+                lastPingReceived = millis();
+                break;
+            }
             setRelay(false);
             sendResponse(ACK_OFF);
             controllerConnected = true;
@@ -206,23 +295,14 @@ void setup() {
     
     // Configuration pins
     pinMode(RELAY_PIN, OUTPUT);
-    pinMode(LED_STATUS, OUTPUT);
+    pinMode(MANUAL_BUTTON_PIN, INPUT_PULLUP);
+    if (LED_STATUS >= 0) {
+        pinMode(LED_STATUS, OUTPUT);
+    }
     
-    /* Test du relais au démarrage
-    Serial.println("Test relais...");
-    Serial.print("GPIO: ");
-    Serial.println(RELAY_PIN);*/
-    
-    // ON
-   /* digitalWrite(RELAY_PIN, HIGH);
-    Serial.println("Relais HIGH");
-    delay(1000);*/
-    
-    // OFF
-   /* digitalWrite(RELAY_PIN, LOW);
-    Serial.println("Relais LOW");
-    delay(1000);*/
-
+    // État initial : relais OFF (sécurité)
+    digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
+    setStatusLed(false);
     
     // Afficher adresse MAC
     WiFi.mode(WIFI_STA);
@@ -251,6 +331,9 @@ void setup() {
 
 void loop() {
     unsigned long now = millis();
+
+    // Gestion du bouton BOOT pour override manuel
+    updateManualButton();
     
     // Vérifier si le verrou anti-redémarrage vient d'expirer
     if (restartLockActive) {
