@@ -2,21 +2,39 @@
  * ============================================
  * RELAIS WEBASTO - XIAO ESP32-C3
  * ============================================
- * 
+ *
  * Reçoit les commandes ESP-NOW du contrôleur
  * et pilote le relais pour le chauffage Webasto
- * 
+ *
  * Sécurité : Arrêt automatique si perte de connexion
+ *
+ * Corrections appliquées :
+ *   - Race condition : les commandes reçues dans le callback WiFi
+ *     sont stockées dans une queue FreeRTOS, puis traitées dans loop().
+ *   - setRelay() n'est plus appelé depuis le callback WiFi.
  */
 
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <nvs_flash.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include "config.h"
 
 // ============================================
+// STRUCTURE POUR LA QUEUE DE COMMANDES
+// ============================================
+
+typedef struct {
+    uint8_t command;       // Commande reçue (CMD_HEAT_ON, CMD_HEAT_OFF, CMD_PING)
+    uint8_t mac[6];        // MAC de l'expéditeur
+    bool    has_mac;       // true si c'est un nouveau contrôleur à enregistrer
+} pending_command_t;
+
+// ============================================
 // VARIABLES GLOBALES
+// (modifiées UNIQUEMENT depuis loop(), plus depuis le callback)
 // ============================================
 
 bool relayOn = false;
@@ -24,9 +42,9 @@ unsigned long lastPingReceived = 0;
 bool controllerConnected = false;
 
 // Sécurité anti-redémarrage rapide
-unsigned long lastRelayOff = 0;           // Moment du dernier arrêt
-bool restartLockActive = false;           // Verrou actif
-const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes de délai
+unsigned long lastRelayOff = 0;
+bool restartLockActive = false;
+const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes
 
 // Override manuel via bouton BOOT
 bool manualOverrideActive = false;
@@ -35,12 +53,16 @@ bool manualButtonPressed = false;
 bool manualButtonHandled = false;
 unsigned long manualButtonPressStart = 0;
 
-// Adresse MAC du contrôleur (sera apprise automatiquement)
+// Adresse MAC du contrôleur (apprise automatiquement)
 uint8_t controllerMac[6] = {0};
 bool controllerKnown = false;
 
+// Queue FreeRTOS pour les commandes reçues du callback WiFi
+static QueueHandle_t cmd_queue = NULL;
+const int CMD_QUEUE_SIZE = 8;
+
 // ============================================
-// STRUCTURE MESSAGE (identique au contrôleur)
+// STRUCTURE MESSAGE ESP-NOW
 // ============================================
 
 typedef struct {
@@ -60,7 +82,6 @@ void setStatusLed(bool on) {
     if (LED_STATUS < 0) {
         return;
     }
-
     digitalWrite(LED_STATUS, on ? LOW : HIGH);  // LED active LOW
 }
 
@@ -73,37 +94,33 @@ void sendCurrentStateResponse() {
 // ============================================
 
 void setRelay(bool on) {
-    bool wasOn = relayOn;  // État précédent
+    bool wasOn = relayOn;
     relayOn = on;
-    
-    // Commander le relais selon la logique configurée
+
     if (RELAY_ACTIVE_HIGH) {
         digitalWrite(RELAY_PIN, on ? HIGH : LOW);
     } else {
         digitalWrite(RELAY_PIN, on ? LOW : HIGH);
     }
-    
-    // LED de statut
+
     setStatusLed(on);
-    
+
     // Activer le verrou UNIQUEMENT si passage de ON à OFF
     if (wasOn && !on) {
         lastRelayOff = millis();
         restartLockActive = true;
         Serial.println("Verrou anti-redemarrage active (3 min)");
     }
-    
+
     Serial.print("Relais: ");
     Serial.println(on ? "ON" : "OFF");
 }
 
-// Vérifie si le redémarrage est autorisé
 bool canRestart() {
     if (!restartLockActive) {
         return true;
     }
-    
-    // Afficher le temps restant
+
     unsigned long elapsed = millis() - lastRelayOff;
     unsigned long remaining = (RESTART_DELAY_MS - elapsed) / 1000;
     Serial.print("!!! REDEMARRAGE BLOQUE - Attendre ");
@@ -111,6 +128,10 @@ bool canRestart() {
     Serial.println(" secondes !!!");
     return false;
 }
+
+// ============================================
+// OVERRIDE MANUEL (bouton BOOT)
+// ============================================
 
 void handleManualOverrideAction() {
     if (!manualOverrideActive) {
@@ -171,10 +192,10 @@ void sendResponse(uint8_t response) {
         Serial.println("Controleur inconnu, pas de reponse");
         return;
     }
-    
+
     outgoingMsg.command = response;
     esp_err_t result = esp_now_send(controllerMac, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
-    
+
     if (result == ESP_OK) {
         Serial.print("Reponse envoyee: ");
         Serial.println(response);
@@ -183,25 +204,54 @@ void sendResponse(uint8_t response) {
     }
 }
 
-// Callback réception ESP-NOW (ESP-IDF 5.x)
+/*
+ * Callback réception ESP-NOW (contexte WiFi).
+ * Ne modifie AUCUNE variable globale directement.
+ * Pousse la commande dans une queue FreeRTOS pour traitement dans loop().
+ */
 void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
     if (len != sizeof(esp_now_message_t)) {
         return;
     }
-    
-    // Mémoriser l'adresse du contrôleur
-    if (!controllerKnown) {
-        memcpy(controllerMac, recv_info->src_addr, 6);
+
+    pending_command_t cmd;
+    cmd.command = data[0];
+    memcpy(cmd.mac, recv_info->src_addr, 6);
+    cmd.has_mac = !controllerKnown;  // Lecture seule, pas de modification
+
+    // Pousser dans la queue (non bloquant, on abandonne si pleine)
+    if (cmd_queue) {
+        xQueueSend(cmd_queue, &cmd, 0);
+    }
+}
+
+// Callback envoi ESP-NOW
+void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+    // Rien à faire
+}
+
+// ============================================
+// TRAITEMENT DES COMMANDES (appelé depuis loop)
+// ============================================
+
+/*
+ * Traite une commande reçue. Appelé uniquement depuis loop(),
+ * jamais depuis le callback WiFi. Toutes les modifications de
+ * variables globales et les appels à setRelay() sont sûrs ici.
+ */
+void processCommand(const pending_command_t &cmd) {
+    // Enregistrer le contrôleur si nouveau
+    if (cmd.has_mac && !controllerKnown) {
+        memcpy(controllerMac, cmd.mac, 6);
         controllerKnown = true;
-        
-        // Ajouter le peer pour pouvoir répondre
+
         esp_now_peer_info_t peerInfo;
         memset(&peerInfo, 0, sizeof(peerInfo));
         memcpy(peerInfo.peer_addr, controllerMac, 6);
         peerInfo.channel = 0;
         peerInfo.encrypt = false;
         esp_now_add_peer(&peerInfo);
-        
+
         Serial.print("Controleur enregistre: ");
         for (int i = 0; i < 6; i++) {
             Serial.printf("%02X", controllerMac[i]);
@@ -209,63 +259,48 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int l
         }
         Serial.println();
     }
-    
-    esp_now_message_t incomingMsg;
-    memcpy(&incomingMsg, data, sizeof(incomingMsg));
-    
+
     Serial.print("Commande recue: ");
-    Serial.println(incomingMsg.command);
-    
-    switch (incomingMsg.command) {
+    Serial.println(cmd.command);
+
+    switch (cmd.command) {
         case CMD_HEAT_ON:
             if (manualOverrideActive) {
                 Serial.println("Commande distante ignoree: override manuel actif");
                 sendCurrentStateResponse();
-                controllerConnected = true;
-                lastPingReceived = millis();
-                break;
-            }
-            if (canRestart()) {
+            } else if (canRestart()) {
                 setRelay(true);
                 sendResponse(ACK_ON);
             } else {
-                sendResponse(ACK_LOCKED);  // Redémarrage bloqué
+                sendResponse(ACK_LOCKED);
             }
             controllerConnected = true;
             lastPingReceived = millis();
             break;
-            
+
         case CMD_HEAT_OFF:
             if (manualOverrideActive) {
                 Serial.println("Commande distante ignoree: override manuel actif");
                 sendCurrentStateResponse();
-                controllerConnected = true;
-                lastPingReceived = millis();
-                break;
+            } else {
+                setRelay(false);
+                sendResponse(ACK_OFF);
             }
-            setRelay(false);
-            sendResponse(ACK_OFF);
             controllerConnected = true;
             lastPingReceived = millis();
             break;
-            
+
         case CMD_PING:
             sendResponse(ACK_PONG);
             controllerConnected = true;
             lastPingReceived = millis();
-            Serial.println("PING recu, PONG envoye");
             break;
-            
+
         default:
             Serial.print("Commande inconnue: ");
-            Serial.println(incomingMsg.command);
+            Serial.println(cmd.command);
             break;
     }
-}
-
-// Callback envoi ESP-NOW (ESP-IDF 5.x)
-void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-    // Rien à faire ici
 }
 
 // ============================================
@@ -274,54 +309,59 @@ void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
 
 void setup() {
     Serial.begin(115200);
-    
+
     // Attendre que le port USB CDC soit prêt (max 3 secondes)
     unsigned long startWait = millis();
     while (!Serial && (millis() - startWait < 3000)) {
         delay(10);
     }
-    delay(100);  // Petit délai supplémentaire pour stabilité
-    
-    setCpuFrequencyMhz(80);  // Économie d'énergie
-    
+    delay(100);
+
+    setCpuFrequencyMhz(80);
+
     Serial.println("\n=== RELAIS WEBASTO ===");
-    
+
     // Initialisation NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
     }
-    
+
     // Configuration pins
     pinMode(RELAY_PIN, OUTPUT);
     pinMode(MANUAL_BUTTON_PIN, INPUT_PULLUP);
     if (LED_STATUS >= 0) {
         pinMode(LED_STATUS, OUTPUT);
     }
-    
+
     // État initial : relais OFF (sécurité)
     digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
     setStatusLed(false);
-    
+
+    // Créer la queue de commandes
+    cmd_queue = xQueueCreate(CMD_QUEUE_SIZE, sizeof(pending_command_t));
+    if (!cmd_queue) {
+        Serial.println("ERREUR: impossible de creer la queue");
+    }
+
     // Afficher adresse MAC
     WiFi.mode(WIFI_STA);
     Serial.print("Adresse MAC: ");
     Serial.println(WiFi.macAddress());
-    
+
     // Initialisation ESP-NOW
     if (esp_now_init() != ESP_OK) {
         Serial.println("Erreur init ESP-NOW");
         return;
     }
-    
-    // Enregistrer callbacks
+
     esp_now_register_recv_cb(onDataRecv);
     esp_now_register_send_cb(onDataSent);
-    
+
     Serial.println("ESP-NOW initialise");
     Serial.println("En attente de commandes...");
-    
+
     lastPingReceived = millis();
 }
 
@@ -332,18 +372,24 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
+    // Traiter les commandes reçues via la queue (thread-safe)
+    pending_command_t cmd;
+    while (xQueueReceive(cmd_queue, &cmd, 0) == pdTRUE) {
+        processCommand(cmd);
+    }
+
     // Gestion du bouton BOOT pour override manuel
     updateManualButton();
-    
+
     // Vérifier si le verrou anti-redémarrage vient d'expirer
     if (restartLockActive) {
         if (now - lastRelayOff >= RESTART_DELAY_MS) {
             restartLockActive = false;
             Serial.println("Verrou anti-redemarrage expire");
-            sendResponse(ACK_UNLOCKED);  // Notifier le contrôleur
+            sendResponse(ACK_UNLOCKED);
         }
     }
-    
+
     // Sécurité : arrêt si pas de ping depuis trop longtemps
     if (controllerConnected && relayOn) {
         if (now - lastPingReceived > SAFETY_TIMEOUT_MS) {
@@ -353,6 +399,6 @@ void loop() {
             controllerConnected = false;
         }
     }
-    
-    delay(100);
+
+    delay(10);  // 10ms au lieu de 100ms pour plus de réactivité
 }
