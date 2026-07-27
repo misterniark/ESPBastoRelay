@@ -147,6 +147,18 @@ bool canRestart() {
     }
 
     unsigned long elapsed = millis() - lastRelayOff;
+
+    // Le verrou est expiré mais la boucle ne l'a pas encore constaté
+    // (les commandes sont traitées AVANT ce contrôle dans le même
+    // tour) : autoriser sans attendre. On ne remet pas le drapeau à
+    // zéro ici — c'est la boucle qui le fait, et c'est elle qui envoie
+    // l'ACK_UNLOCKED au contrôleur. Sans ce test, une demande arrivant
+    // pile à l'expiration était refusée à tort, et le calcul du temps
+    // restant ci-dessous débordait (affichage de ~4 milliards de s).
+    if (elapsed >= RESTART_DELAY_MS) {
+        return true;
+    }
+
     unsigned long remaining = (RESTART_DELAY_MS - elapsed) / 1000;
     Serial.print("!!! REDEMARRAGE BLOQUE - Attendre ");
     Serial.print(remaining);
@@ -180,6 +192,16 @@ void handleManualOverrideAction() {
         } else {
             Serial.println("Override manuel: FORCE ON refuse par verrou");
             sendResponse(ACK_LOCKED);
+            // ANNULER l'override plutôt que de rester dans un état
+            // incohérent « override actif / forcé ON / relais OFF » :
+            // l'utilisateur croirait avoir forcé la chauffe (aucune LED
+            // ne l'informe), le contrôle distant serait ignoré, et
+            // l'expiration du verrou ne rallumerait jamais. Il lui
+            // fallait alors trois appuis longs de plus pour s'en
+            // sortir. Ici, un nouvel appui après expiration du verrou
+            // fonctionnera normalement.
+            manualOverrideActive = false;
+            manualForcedState = false;
         }
     } else {
         setRelay(false);
@@ -529,18 +551,52 @@ void processCommand(const pending_command_t &cmd) {
 // ============================================
 
 void setup() {
+    // ================= TOUTE PREMIÈRE INSTRUCTION =================
+    // Mettre le relais dans son état sûr AVANT quoi que ce soit
+    // d'autre. Entre le reset et cette ligne, la broche est en haute
+    // impédance : l'entrée du module relais flotte. Auparavant cette
+    // configuration venait après l'attente du port série (jusqu'à 3 s)
+    // et l'init NVS — soit plusieurs secondes de flottement à CHAQUE
+    // démarrage, y compris après un brownout en pleine chauffe.
+    //
+    // Le niveau est écrit AVANT pinMode() : ainsi le verrou de sortie
+    // contient déjà l'état sûr quand la broche passe en sortie, sans
+    // impulsion parasite. Indispensable pour un module actif-LOW, où
+    // l'ordre inverse produirait un bref ON.
+    // (Une résistance de rappel externe reste recommandée : elle seule
+    // couvre la fenêtre reset → première instruction.)
+    digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
+
+    // Hypothèse conservatrice sur l'origine de ce démarrage : il peut
+    // faire suite à une coupure d'alimentation ALORS QUE le Webasto
+    // chauffait. Impossible de le savoir — on arme donc le verrou
+    // anti-redémarrage comme si l'on venait de couper à chaud. Sans
+    // cela, un brownout suffisait à autoriser un rallumage immédiat,
+    // exactement ce que le verrou existe pour empêcher.
+    lastRelayOff = millis();
+    restartLockActive = true;
+
     Serial.begin(115200);
 
-    // Attendre que le port USB CDC soit prêt (max 3 secondes)
+#ifdef TEST_CLI
+    // Banc de test uniquement : laisser à l'hôte le temps d'attacher le
+    // port USB. En production personne n'écoute, et cette attente
+    // retarderait pour rien la reprise des communications après un
+    // brownout.
     unsigned long startWait = millis();
     while (!Serial && (millis() - startWait < 3000)) {
         delay(10);
     }
+#endif
     delay(100);
 
     setCpuFrequencyMhz(80);
 
     Serial.println("\n=== RELAIS WEBASTO ===");
+    Serial.printf("Relais OFF, verrou anti-redemarrage arme au boot (%lu s)\n",
+                  RESTART_DELAY_MS / 1000UL);
 
     // Initialisation NVS
     esp_err_t ret = nvs_flash_init();
@@ -549,15 +605,12 @@ void setup() {
         nvs_flash_init();
     }
 
-    // Configuration pins
-    pinMode(RELAY_PIN, OUTPUT);
+    // Configuration des autres broches (le relais est déjà dans son
+    // état sûr depuis la première instruction de setup())
     pinMode(MANUAL_BUTTON_PIN, INPUT_PULLUP);
     if (LED_STATUS >= 0) {
         pinMode(LED_STATUS, OUTPUT);
     }
-
-    // État initial : relais OFF (sécurité)
-    digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
     setStatusLed(false);
 
     // Créer la queue de commandes
@@ -671,6 +724,14 @@ void loop() {
             Serial.println("!!! Arret automatique du chauffage !!!");
             setRelay(false);
             controllerConnected = false;
+            // La sécurité prime sur l'override manuel, mais il faut
+            // aussi en effacer les drapeaux : sinon le relais reste
+            // OFF avec « forcé ON » en mémoire, et tous les HEAT_ON du
+            // contrôleur seront ignorés à son retour — chauffage
+            // indisponible à distance jusqu'à une action physique sur
+            // le bouton.
+            manualOverrideActive = false;
+            manualForcedState = false;
             // Informer le contrôleur (best effort : la connexion est
             // peut-être réellement morte) : sans cet envoi, il resterait
             // en HEATING alors que le relais est OFF — chauffage coupé
