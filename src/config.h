@@ -37,6 +37,14 @@
 #define ACK_LOCKED    14    // Redémarrage bloqué (délai de sécurité)
 #define ACK_UNLOCKED  15    // Redémarrage autorisé (délai expiré)
 
+// Second octet du message : état réel du relais, porté par ACK_PONG.
+// C'est ce qui permet au contrôleur de détecter toute désynchronisation
+// (reboot d'un des deux appareils, ACK perdu) et de se resynchroniser
+// en un intervalle de ping, au lieu d'afficher indéfiniment un état
+// faux. Ignoré pour les autres codes de réponse.
+#define RELAY_STATE_OFF  0
+#define RELAY_STATE_ON   1
+
 // ============================================
 // CONFIGURATION RELAIS
 // ============================================

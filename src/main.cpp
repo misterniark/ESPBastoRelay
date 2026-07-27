@@ -46,10 +46,18 @@ unsigned long lastRelayOff = 0;
 bool restartLockActive = false;
 // Délai minimal entre une extinction et le rallumage suivant : un
 // Webasto rallumé à chaud sans son cycle de purge noie la chambre de
-// combustion et encrasse la bougie. (Pour les tests sur banc, mettre
-// temporairement 0 : le verrou s'arme puis expire aussitôt, le
-// protocole ACK_OFF/ACK_UNLOCKED avec le contrôleur reste intact.)
-const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes
+// combustion et encrasse la bougie.
+#ifdef TEST_CLI
+// Banc de test uniquement : verrou raccourci pour enchaîner les
+// scénarios sans attendre 3 minutes entre chaque cycle. Le mécanisme
+// reste exercé à l'identique (armement, ACK_LOCKED, ACK_UNLOCKED) —
+// seule sa durée change. Le firmware de production, lui, garde la
+// valeur nominale : plus besoin de modifier cette constante à la main
+// pour tester, donc plus de risque de livrer un verrou désactivé.
+const unsigned long RESTART_DELAY_MS = 5000;    // 5 s (banc)
+#else
+const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes (production)
+#endif
 
 // Override manuel via bouton BOOT
 bool manualOverrideActive = false;
@@ -70,14 +78,19 @@ const int CMD_QUEUE_SIZE = 8;
 // STRUCTURE MESSAGE ESP-NOW
 // ============================================
 
+// 2 octets : le code, plus un octet de charge utile qui porte l'état
+// réel du relais dans les ACK_PONG (RELAY_STATE_OFF/ON) — voir config.h.
+// La réception tolère 1 ou 2 octets pour rester compatible avec un
+// contrôleur non encore mis à jour (l'octet d'état est alors absent).
 typedef struct {
     uint8_t command;
+    uint8_t payload;
 } esp_now_message_t;
 
 esp_now_message_t outgoingMsg;
 
 // Déclarations anticipées
-void sendResponse(uint8_t response);
+void sendResponse(uint8_t response, uint8_t payload = 0);
 
 // ============================================
 // FONCTIONS LED
@@ -114,7 +127,10 @@ void setRelay(bool on) {
     if (wasOn && !on) {
         lastRelayOff = millis();
         restartLockActive = true;
-        Serial.println("Verrou anti-redemarrage active (3 min)");
+        // Afficher la durée RÉELLE : elle diffère entre le firmware de
+        // production (3 min) et celui du banc de test (5 s).
+        Serial.printf("Verrou anti-redemarrage active (%lu s)\n",
+                      RESTART_DELAY_MS / 1000UL);
     }
 
     Serial.print("Relais: ");
@@ -192,13 +208,14 @@ void updateManualButton() {
 // FONCTIONS ESP-NOW
 // ============================================
 
-void sendResponse(uint8_t response) {
+void sendResponse(uint8_t response, uint8_t payload) {
     if (!controllerKnown) {
         Serial.println("Controleur inconnu, pas de reponse");
         return;
     }
 
     outgoingMsg.command = response;
+    outgoingMsg.payload = payload;
     esp_err_t result = esp_now_send(controllerMac, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
 
     if (result == ESP_OK) {
@@ -215,7 +232,10 @@ void sendResponse(uint8_t response) {
  * Pousse la commande dans une queue FreeRTOS pour traitement dans loop().
  */
 void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    if (len != sizeof(esp_now_message_t)) {
+    // Tolérance de taille : 2 octets (protocole courant, avec l'octet
+    // d'état) ou 1 octet (contrôleur non encore mis à jour). Rejeter
+    // tout le reste.
+    if (len < 1 || len > (int)sizeof(esp_now_message_t)) {
         return;
     }
 
@@ -367,7 +387,12 @@ void processCommand(const pending_command_t &cmd) {
             break;
 
         case CMD_PING:
-            sendResponse(ACK_PONG);
+            // Le PONG porte l'état RÉEL du relais : c'est le mécanisme
+            // de resynchronisation du système. Après un reboot de l'un
+            // ou l'autre appareil, ou la perte d'un ACK, le contrôleur
+            // détecte l'écart au ping suivant et se remet d'accord avec
+            // la réalité au lieu d'afficher un état faux indéfiniment.
+            sendResponse(ACK_PONG, relayOn ? RELAY_STATE_ON : RELAY_STATE_OFF);
             controllerConnected = true;
             lastPingReceived = millis();
             break;
