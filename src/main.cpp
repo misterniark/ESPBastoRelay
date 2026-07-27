@@ -44,6 +44,11 @@ bool controllerConnected = false;
 // Sécurité anti-redémarrage rapide
 unsigned long lastRelayOff = 0;
 bool restartLockActive = false;
+// Délai minimal entre une extinction et le rallumage suivant : un
+// Webasto rallumé à chaud sans son cycle de purge noie la chambre de
+// combustion et encrasse la bougie. (Pour les tests sur banc, mettre
+// temporairement 0 : le verrou s'arme puis expire aussitôt, le
+// protocole ACK_OFF/ACK_UNLOCKED avec le contrôleur reste intact.)
 const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes
 
 // Override manuel via bouton BOOT
@@ -239,7 +244,69 @@ void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
  * jamais depuis le callback WiFi. Toutes les modifications de
  * variables globales et les appels à setRelay() sont sûrs ici.
  */
+#ifdef TEST_CLI
+// ============================================
+// BANC DE TEST SÉRIE — JAMAIS EN PRODUCTION
+// (env seeed_xiao_esp32c3_test uniquement)
+// Commandes :
+//   mute <s>  → ignorer TOUT message ESP-NOW entrant pendant <s>
+//               secondes (simule la perte de liaison : les pings ne
+//               rafraîchissent plus lastPingReceived, le watchdog
+//               SAFETY_TIMEOUT_MS doit couper le chauffage)
+//   status    → état relais/verrou/connexion/mute
+// L'ÉMISSION reste active pendant le mute (le relais peut toujours
+// notifier ses coupures) — seule la RÉCEPTION est simulée coupée.
+// ============================================
+unsigned long tcliMuteUntilMs = 0;
+
+bool tcliIsMuted() {
+    return tcliMuteUntilMs != 0 && millis() < tcliMuteUntilMs;
+}
+
+void tcliHandleLine(const char *line) {
+    if (strncmp(line, "mute ", 5) == 0) {
+        long s = atol(line + 5);
+        tcliMuteUntilMs = millis() + (unsigned long)s * 1000UL;
+        Serial.printf("[TCLI] mute %ld s (reception ESP-NOW ignoree)\n", s);
+    } else if (strcmp(line, "status") == 0) {
+        Serial.printf("[TCLI] status: relais=%d verrou=%d connecte=%d mute=%d\n",
+                      (int)relayOn, (int)restartLockActive,
+                      (int)controllerConnected, (int)tcliIsMuted());
+    } else {
+        Serial.printf("[TCLI] commande inconnue: '%s'\n", line);
+    }
+}
+
+void tcliUpdate() {
+    static char buf[32];
+    static size_t len = 0;
+    while (Serial.available() > 0) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (len > 0) {
+                buf[len] = '\0';
+                tcliHandleLine(buf);
+                len = 0;
+            }
+        } else if (len < sizeof(buf) - 1) {
+            buf[len++] = c;
+        } else {
+            len = 0;
+        }
+    }
+}
+#endif // TEST_CLI
+
 void processCommand(const pending_command_t &cmd) {
+#ifdef TEST_CLI
+    // Banc de test : liaison simulée coupée — ignorer le message AVANT
+    // toute mise à jour (lastPingReceived ne doit pas être rafraîchi)
+    if (tcliIsMuted()) {
+        Serial.println("[TCLI] MUTE: message ESP-NOW ignore");
+        return;
+    }
+#endif
+
     // Enregistrer le contrôleur si nouveau
     if (cmd.has_mac && !controllerKnown) {
         memcpy(controllerMac, cmd.mac, 6);
@@ -285,6 +352,15 @@ void processCommand(const pending_command_t &cmd) {
             } else {
                 setRelay(false);
                 sendResponse(ACK_OFF);
+                // Resynchronisation : si le relais était DÉJÀ éteint
+                // (coupure de sécurité locale antérieure), setRelay(false)
+                // n'a pas armé le verrou (pas de transition ON→OFF) et
+                // aucun ACK_UNLOCKED ne viendra jamais — le contrôleur,
+                // passé LOCKED sur notre ACK_OFF, resterait bloqué à vie.
+                // Lui signaler tout de suite que le redémarrage est permis.
+                if (!restartLockActive) {
+                    sendResponse(ACK_UNLOCKED);
+                }
             }
             controllerConnected = true;
             lastPingReceived = millis();
@@ -372,6 +448,11 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
+#ifdef TEST_CLI
+    // Banc de test : traiter les commandes série (mute/status)
+    tcliUpdate();
+#endif
+
     // Traiter les commandes reçues via la queue (thread-safe)
     pending_command_t cmd;
     while (xQueueReceive(cmd_queue, &cmd, 0) == pdTRUE) {
@@ -381,22 +462,38 @@ void loop() {
     // Gestion du bouton BOOT pour override manuel
     updateManualButton();
 
-    // Vérifier si le verrou anti-redémarrage vient d'expirer
+    // Vérifier si le verrou anti-redémarrage vient d'expirer.
+    // ATTENTION : utiliser millis() FRAIS et non `now` capturé en début
+    // de tour — processCommand() vient peut-être de poser lastRelayOff
+    // à un instant POSTÉRIEUR à `now`, et `now - lastRelayOff` en non
+    // signé déborderait (~2^32) > RESTART_DELAY_MS : le verrou
+    // « expirait » instantanément après chaque coupure par commande
+    // (bug historique découvert au banc de test du 27/07/2026).
     if (restartLockActive) {
-        if (now - lastRelayOff >= RESTART_DELAY_MS) {
+        if (millis() - lastRelayOff >= RESTART_DELAY_MS) {
             restartLockActive = false;
             Serial.println("Verrou anti-redemarrage expire");
             sendResponse(ACK_UNLOCKED);
         }
     }
 
-    // Sécurité : arrêt si pas de ping depuis trop longtemps
+    // Sécurité : arrêt si pas de ping depuis trop longtemps.
+    // Même piège de débordement que ci-dessus : lastPingReceived est
+    // rafraîchi par processCommand() APRÈS la capture de `now` — avec
+    // `now`, le chauffage se coupait « perte connexion » dans la
+    // milliseconde suivant chaque allumage.
     if (controllerConnected && relayOn) {
-        if (now - lastPingReceived > SAFETY_TIMEOUT_MS) {
+        if (millis() - lastPingReceived > SAFETY_TIMEOUT_MS) {
             Serial.println("!!! SECURITE: Perte connexion controleur !!!");
             Serial.println("!!! Arret automatique du chauffage !!!");
             setRelay(false);
             controllerConnected = false;
+            // Informer le contrôleur (best effort : la connexion est
+            // peut-être réellement morte) : sans cet envoi, il resterait
+            // en HEATING alors que le relais est OFF — chauffage coupé
+            // silencieusement. ACK_OFF le fait passer en LOCKED, puis
+            // l'ACK_UNLOCKED d'expiration du verrou le libérera.
+            sendResponse(ACK_OFF);
         }
     }
 
