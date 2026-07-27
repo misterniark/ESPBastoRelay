@@ -56,4 +56,34 @@
 // Timeout sécurité : éteindre si pas de ping reçu (en ms)
 #define SAFETY_TIMEOUT_MS  180000  // 3 minutes sans ping = arrêt sécurité
 
+// Délai au bout duquel le relais OUBLIE son contrôleur appairé et
+// redevient appairable par n'importe lequel. C'est la porte de sortie
+// du filtrage par MAC : sans elle, un contrôleur remplacé (carte HS,
+// nouveau matériel) ne pourrait plus JAMAIS piloter ce relais sans
+// reflasher. Largement supérieur à l'intervalle de ping (60 s) : ce
+// délai n'est atteint que si le contrôleur a réellement disparu.
+#define CONTROLLER_FORGET_MS  600000  // 10 minutes sans message valide
+
+// ============================================
+// CHIFFREMENT ESP-NOW
+//
+// ⚠️ CES DEUX CLÉS DOIVENT ÊTRE IDENTIQUES DANS LES DEUX FIRMWARES.
+// La copie de référence côté contrôleur est dans
+// EspBastoClaude/src/config.h. Après modification, reflasher LES DEUX
+// cartes : des clés différentes = plus aucune communication (donc plus
+// de chauffage pilotable).
+//
+// Sans chiffrement, n'importe quel ESP32 à portée peut commander le
+// chauffage : le filtrage par MAC seul se contourne par usurpation
+// d'adresse. La découverte par diffusion reste en clair (ESP-NOW
+// interdit le chiffrement en broadcast) ; seul le trafic unicast
+// contrôleur ↔ relais est chiffré.
+// ============================================
+#define ESPNOW_PMK_BYTES { \
+    0x45, 0x53, 0x50, 0x42, 0x61, 0x73, 0x74, 0x6F, \
+    0x2D, 0x50, 0x4D, 0x4B, 0x2D, 0x76, 0x31, 0x21 }
+#define ESPNOW_LMK_BYTES { \
+    0x57, 0x65, 0x62, 0x61, 0x73, 0x74, 0x6F, 0x2D, \
+    0x4C, 0x4D, 0x4B, 0x2D, 0x76, 0x31, 0x21, 0x3F }
+
 #endif

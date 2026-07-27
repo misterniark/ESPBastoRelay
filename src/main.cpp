@@ -18,9 +18,11 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <nvs_flash.h>
+#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include "config.h"
+#include "usb_cdc_kick.h"  // ZLP périodique anti-échouage des logs USB
 
 // ============================================
 // STRUCTURE POUR LA QUEUE DE COMMANDES
@@ -30,6 +32,7 @@ typedef struct {
     uint8_t command;       // Commande reçue (CMD_HEAT_ON, CMD_HEAT_OFF, CMD_PING)
     uint8_t mac[6];        // MAC de l'expéditeur
     bool    has_mac;       // true si c'est un nouveau contrôleur à enregistrer
+    bool    broadcast;     // true si le message est arrivé en diffusion
 } pending_command_t;
 
 // ============================================
@@ -91,6 +94,7 @@ esp_now_message_t outgoingMsg;
 
 // Déclarations anticipées
 void sendResponse(uint8_t response, uint8_t payload = 0);
+void addControllerPeer(bool encrypt);
 
 // ============================================
 // FONCTIONS LED
@@ -208,6 +212,67 @@ void updateManualButton() {
 // FONCTIONS ESP-NOW
 // ============================================
 
+// ============================================
+// PERSISTANCE DE LA MAC DU CONTRÔLEUR (NVS)
+//
+// Pourquoi : avec le chiffrement, un relais qui redémarre sans se
+// souvenir de son contrôleur ne peut plus DÉCHIFFRER ses pings — il
+// faudrait attendre l'échec des 3 tentatives unicast puis un
+// réappairage par diffusion (~20 s), et la désynchronisation ne serait
+// détectée que par la perte de connexion (2 min) au lieu du premier
+// PONG (60 s). En mémorisant la MAC, le relais réenregistre le peer
+// chiffré dès son démarrage et la resynchronisation reste immédiate.
+// ============================================
+Preferences prefs;
+const char *NVS_NAMESPACE = "espbasto";
+const char *NVS_KEY_CTRL_MAC = "ctrl_mac";
+
+void saveControllerMac() {
+    if (!prefs.begin(NVS_NAMESPACE, false)) return;
+    prefs.putBytes(NVS_KEY_CTRL_MAC, controllerMac, 6);
+    prefs.end();
+}
+
+void forgetControllerMac() {
+    if (!prefs.begin(NVS_NAMESPACE, false)) return;
+    prefs.remove(NVS_KEY_CTRL_MAC);
+    prefs.end();
+}
+
+// Recharge la MAC mémorisée et réenregistre le peer chiffré.
+// @return true si un contrôleur était mémorisé
+bool loadControllerMac() {
+    if (!prefs.begin(NVS_NAMESPACE, true)) return false;
+    size_t len = prefs.getBytesLength(NVS_KEY_CTRL_MAC);
+    bool found = (len == 6) && (prefs.getBytes(NVS_KEY_CTRL_MAC, controllerMac, 6) == 6);
+    prefs.end();
+    return found;
+}
+
+// (Ré)enregistre le contrôleur comme peer ESP-NOW, en clair ou chiffré.
+// Un peer existant est supprimé d'abord : c'est ainsi qu'on passe du
+// clair (appairage) au chiffré (exploitation).
+void addControllerPeer(bool encrypt) {
+    static const uint8_t lmk[16] = ESPNOW_LMK_BYTES;
+
+    esp_now_del_peer(controllerMac);  // sans effet s'il n'existe pas
+
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, controllerMac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = encrypt;
+    if (encrypt) {
+        memcpy(peerInfo.lmk, lmk, sizeof(peerInfo.lmk));
+    }
+
+    esp_err_t r = esp_now_add_peer(&peerInfo);
+    if (r != ESP_OK) {
+        Serial.printf("Erreur ajout peer controleur (%s): %d\n",
+                      encrypt ? "chiffre" : "clair", r);
+    }
+}
+
 void sendResponse(uint8_t response, uint8_t payload) {
     if (!controllerKnown) {
         Serial.println("Controleur inconnu, pas de reponse");
@@ -243,6 +308,13 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int l
     cmd.command = data[0];
     memcpy(cmd.mac, recv_info->src_addr, 6);
     cmd.has_mac = !controllerKnown;  // Lecture seule, pas de modification
+
+    // Le message est-il arrivé en diffusion ? Déterminant pour la
+    // suite : un contrôleur qui diffuse est en phase de (re)découverte,
+    // il a supprimé son peer et ne peut donc PAS déchiffrer nos
+    // réponses (voir processCommand).
+    static const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    cmd.broadcast = (memcmp(recv_info->des_addr, BCAST, 6) == 0);
 
     // Pousser dans la queue (non bloquant, on abandonne si pleine)
     if (cmd_queue) {
@@ -327,17 +399,42 @@ void processCommand(const pending_command_t &cmd) {
     }
 #endif
 
-    // Enregistrer le contrôleur si nouveau
+    // FILTRAGE DE LA SOURCE : une fois appairé, n'obéir qu'à SON
+    // contrôleur. Sans ce test, toute trame d'un octet, de n'importe
+    // quelle source, allumait le Webasto (constat bloquant de l'audit
+    // du 27/07/2026) — y compris, sans malveillance, celle du kit
+    // identique d'un van voisin. La porte de sortie est le délai
+    // d'oubli ci-dessous : un contrôleur remplacé peut se réappairer.
+    if (controllerKnown && memcmp(cmd.mac, controllerMac, 6) != 0) {
+        Serial.printf("Commande ignoree : source inattendue "
+                      "%02X:%02X:%02X:%02X:%02X:%02X\n",
+                      cmd.mac[0], cmd.mac[1], cmd.mac[2],
+                      cmd.mac[3], cmd.mac[4], cmd.mac[5]);
+        return;
+    }
+
+    // Enregistrer le contrôleur si nouveau.
+    // Le peer est d'abord ajouté EN CLAIR : le contrôleur ne nous
+    // connaît pas encore et ne pourrait pas déchiffrer notre réponse
+    // (ESP-NOW déchiffre grâce à l'entrée de peer, qu'il n'a pas
+    // encore). On lui répond donc en clair, puis on bascule en chiffré
+    // juste après (voir la fin de cette fonction) : à partir de là tout
+    // l'unicast est chiffré dans les deux sens.
+    // Une trame de DIFFUSION ne peut pas être chiffrée : n'y accepter
+    // que le ping de (re)découverte. Toute commande d'actionnement doit
+    // arriver en unicast — donc chiffrée une fois l'appairage fait.
+    // Sans cette règle, une simple diffusion en clair suffirait à
+    // commander le chauffage en contournant le chiffrement.
+    if (cmd.broadcast && cmd.command != CMD_PING) {
+        Serial.printf("Commande %d ignoree : recue en diffusion\n", cmd.command);
+        return;
+    }
+
+    bool justPaired = false;
     if (cmd.has_mac && !controllerKnown) {
         memcpy(controllerMac, cmd.mac, 6);
         controllerKnown = true;
-
-        esp_now_peer_info_t peerInfo;
-        memset(&peerInfo, 0, sizeof(peerInfo));
-        memcpy(peerInfo.peer_addr, controllerMac, 6);
-        peerInfo.channel = 0;
-        peerInfo.encrypt = false;
-        esp_now_add_peer(&peerInfo);
+        justPaired = true;
 
         Serial.print("Controleur enregistre: ");
         for (int i = 0; i < 6; i++) {
@@ -345,6 +442,20 @@ void processCommand(const pending_command_t &cmd) {
             if (i < 5) Serial.print(":");
         }
         Serial.println();
+    }
+
+    // RÉPONDRE EN CLAIR dans deux cas :
+    //   - appairage initial : le contrôleur ne nous connaît pas encore ;
+    //   - message reçu en DIFFUSION : le contrôleur est en train de nous
+    //     redécouvrir, il a supprimé son peer et ne peut plus déchiffrer.
+    // Ce second cas est indispensable : sans lui, un relais qui se
+    // souvient du contrôleur lui répondait chiffré alors qu'il ne
+    // pouvait plus lire — les deux appareils restaient bloqués face à
+    // face indéfiniment (constaté au banc le 27/07/2026, campagne T9).
+    // Le peer est rebasculé en chiffré juste après la réponse.
+    bool clearReply = justPaired || cmd.broadcast;
+    if (clearReply && controllerKnown) {
+        addControllerPeer(false);
     }
 
     Serial.print("Commande recue: ");
@@ -402,6 +513,15 @@ void processCommand(const pending_command_t &cmd) {
             Serial.println(cmd.command);
             break;
     }
+
+    // Appairage terminé : la réponse en clair est partie, on bascule le
+    // peer en CHIFFRÉ. Le contrôleur en fait autant de son côté dès
+    // qu'il a reçu cette réponse. Tout l'unicast suivant est chiffré.
+    if (clearReply && controllerKnown) {
+        addControllerPeer(true);
+        saveControllerMac();  // pour rester appairé au prochain reboot
+        Serial.println("Liaison chiffree activee");
+    }
 }
 
 // ============================================
@@ -457,8 +577,31 @@ void setup() {
         return;
     }
 
+    // Clé primaire : protège les LMK des peers. Doit être identique
+    // côté contrôleur (voir config.h des deux projets).
+    {
+        static const uint8_t pmk[16] = ESPNOW_PMK_BYTES;
+        if (esp_now_set_pmk(pmk) != ESP_OK) {
+            Serial.println("ATTENTION : echec configuration de la PMK");
+        }
+    }
+
     esp_now_register_recv_cb(onDataRecv);
     esp_now_register_send_cb(onDataSent);
+
+    // Réappairage immédiat si un contrôleur était mémorisé : le peer
+    // chiffré est reconstitué avant même le premier ping, donc aucune
+    // phase de redécouverte après un simple reboot du relais.
+    if (loadControllerMac()) {
+        controllerKnown = true;
+        addControllerPeer(true);
+        Serial.print("Controleur memorise: ");
+        for (int i = 0; i < 6; i++) {
+            Serial.printf("%02X", controllerMac[i]);
+            if (i < 5) Serial.print(":");
+        }
+        Serial.println(" (liaison chiffree)");
+    }
 
     Serial.println("ESP-NOW initialise");
     Serial.println("En attente de commandes...");
@@ -502,6 +645,21 @@ void loop() {
         }
     }
 
+    // Oubli du contrôleur appairé après une absence prolongée : porte
+    // de sortie du filtrage par MAC (voir CONTROLLER_FORGET_MS). Le
+    // relais redevient appairable, ce qui permet de remplacer le
+    // contrôleur sans reflasher le relais. Sans danger : le chauffage
+    // a déjà été coupé par le watchdog bien avant (3 min).
+    if (controllerKnown && !relayOn
+        && millis() - lastPingReceived > CONTROLLER_FORGET_MS) {
+        Serial.println("Controleur absent depuis longtemps : oubli, "
+                       "relais reappairable");
+        esp_now_del_peer(controllerMac);
+        forgetControllerMac();
+        controllerKnown = false;
+        controllerConnected = false;
+    }
+
     // Sécurité : arrêt si pas de ping depuis trop longtemps.
     // Même piège de débordement que ci-dessus : lastPingReceived est
     // rafraîchi par processCommand() APRÈS la capture de `now` — avec
@@ -523,4 +681,9 @@ void loop() {
     }
 
     delay(10);  // 10ms au lieu de 100ms pour plus de réactivité
+
+    // Terminer toute transaction USB laissée ouverte par un paquet de
+    // 64 octets pile, sinon les logs peuvent rester invisibles côté
+    // hôte pendant des dizaines de secondes (voir usb_cdc_kick.h).
+    usb_cdc_kick();
 }
