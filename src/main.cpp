@@ -51,16 +51,33 @@ bool restartLockActive = false;
 // Webasto rallumé à chaud sans son cycle de purge noie la chambre de
 // combustion et encrasse la bougie.
 #ifdef TEST_CLI
-// Banc de test uniquement : verrou raccourci pour enchaîner les
+// Banc de test uniquement : verrous raccourcis pour enchaîner les
 // scénarios sans attendre 3 minutes entre chaque cycle. Le mécanisme
 // reste exercé à l'identique (armement, ACK_LOCKED, ACK_UNLOCKED) —
-// seule sa durée change. Le firmware de production, lui, garde la
-// valeur nominale : plus besoin de modifier cette constante à la main
+// seule sa durée change. Le firmware de production, lui, garde les
+// valeurs nominales : plus besoin de modifier ces constantes à la main
 // pour tester, donc plus de risque de livrer un verrou désactivé.
-const unsigned long RESTART_DELAY_MS = 5000;    // 5 s (banc)
+// Valeurs DIFFÉRENTES à dessein : c'est ce qui permet de vérifier au
+// banc que le bon verrou est armé selon l'origine. Deux durées égales
+// rendraient le mécanisme indiscernable dans les journaux.
+const unsigned long RESTART_DELAY_MS      = 5000;   // 5 s (extinction, banc)
+const unsigned long BOOT_RESTART_DELAY_MS = 3000;   // 3 s (démarrage, banc)
 #else
-const unsigned long RESTART_DELAY_MS = 180000;  // 3 minutes (production)
+// Après une extinction ALORS QUE LE CHAUFFAGE TOURNAIT : délai complet.
+// Le Webasto vient d'être coupé à chaud et doit finir sa purge.
+const unsigned long RESTART_DELAY_MS      = 180000; // 3 minutes
+// Au DÉMARRAGE du relais : délai réduit. La différence est une
+// question de certitude — après une extinction on SAIT que l'appareil
+// chauffait ; au démarrage on l'ignore, ce redémarrage peut aussi bien
+// suivre une simple mise sous tension. Une minute suffit à empêcher un
+// rallumage immédiat après une microcoupure survenue en pleine chauffe,
+// sans imposer trois minutes de froid à chaque coupure d'alimentation.
+const unsigned long BOOT_RESTART_DELAY_MS = 60000;  // 1 minute
 #endif
+
+// Durée du verrou actuellement armé : dépend de son origine (voir
+// ci-dessus). Toutes les comparaisons d'expiration l'utilisent.
+unsigned long restartLockDelayMs = RESTART_DELAY_MS;
 
 // Override manuel via bouton BOOT
 bool manualOverrideActive = false;
@@ -131,10 +148,11 @@ void setRelay(bool on) {
     if (wasOn && !on) {
         lastRelayOff = millis();
         restartLockActive = true;
-        // Afficher la durée RÉELLE : elle diffère entre le firmware de
-        // production (3 min) et celui du banc de test (5 s).
+        // Extinction à chaud avérée : délai complet (et non celui,
+        // plus court, du démarrage).
+        restartLockDelayMs = RESTART_DELAY_MS;
         Serial.printf("Verrou anti-redemarrage active (%lu s)\n",
-                      RESTART_DELAY_MS / 1000UL);
+                      restartLockDelayMs / 1000UL);
     }
 
     Serial.print("Relais: ");
@@ -155,11 +173,11 @@ bool canRestart() {
     // l'ACK_UNLOCKED au contrôleur. Sans ce test, une demande arrivant
     // pile à l'expiration était refusée à tort, et le calcul du temps
     // restant ci-dessous débordait (affichage de ~4 milliards de s).
-    if (elapsed >= RESTART_DELAY_MS) {
+    if (elapsed >= restartLockDelayMs) {
         return true;
     }
 
-    unsigned long remaining = (RESTART_DELAY_MS - elapsed) / 1000;
+    unsigned long remaining = (restartLockDelayMs - elapsed) / 1000;
     Serial.print("!!! REDEMARRAGE BLOQUE - Attendre ");
     Serial.print(remaining);
     Serial.println(" secondes !!!");
@@ -577,6 +595,7 @@ void setup() {
     // exactement ce que le verrou existe pour empêcher.
     lastRelayOff = millis();
     restartLockActive = true;
+    restartLockDelayMs = BOOT_RESTART_DELAY_MS;
 
     Serial.begin(115200);
 
@@ -596,7 +615,7 @@ void setup() {
 
     Serial.println("\n=== RELAIS WEBASTO ===");
     Serial.printf("Relais OFF, verrou anti-redemarrage arme au boot (%lu s)\n",
-                  RESTART_DELAY_MS / 1000UL);
+                  restartLockDelayMs / 1000UL);
 
     // Initialisation NVS
     esp_err_t ret = nvs_flash_init();
@@ -687,11 +706,11 @@ void loop() {
     // ATTENTION : utiliser millis() FRAIS et non `now` capturé en début
     // de tour — processCommand() vient peut-être de poser lastRelayOff
     // à un instant POSTÉRIEUR à `now`, et `now - lastRelayOff` en non
-    // signé déborderait (~2^32) > RESTART_DELAY_MS : le verrou
+    // signé déborderait (~2^32) > la durée du verrou : celui-ci
     // « expirait » instantanément après chaque coupure par commande
     // (bug historique découvert au banc de test du 27/07/2026).
     if (restartLockActive) {
-        if (millis() - lastRelayOff >= RESTART_DELAY_MS) {
+        if (millis() - lastRelayOff >= restartLockDelayMs) {
             restartLockActive = false;
             Serial.println("Verrou anti-redemarrage expire");
             sendResponse(ACK_UNLOCKED);
